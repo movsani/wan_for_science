@@ -118,20 +118,81 @@ def main():
     
     # Load checkpoint
     print(f"Loading checkpoint from {args.checkpoint}")
-    checkpoint = torch.load(args.checkpoint, map_location=device)
+    checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
     
     # Handle different checkpoint formats
-    if "model_state_dict" in checkpoint:
-        model.load_state_dict(checkpoint["model_state_dict"])
-    elif "channel_adapter" in checkpoint:
-        # Adapter-only checkpoint
-        model.channel_adapter.load_state_dict(checkpoint["channel_adapter"])
-        if "spatial_encoder" in checkpoint:
-            model.spatial_encoder.load_state_dict(checkpoint["spatial_encoder"])
-        if "spatial_decoder" in checkpoint:
-            model.spatial_decoder.load_state_dict(checkpoint["spatial_decoder"])
+    if "channel_adapter" in checkpoint and "model_state_dict" not in checkpoint:
+        # Adapter-only checkpoint (from *_adapters.pt files)
+        # Use the model's built-in load method
+        model.load_checkpoint(args.checkpoint)
+    elif "model_state_dict" in checkpoint:
+        # Full checkpoint - extract only the trainable adapter and LoRA weights
+        print("Full checkpoint detected - extracting trainable weights only...")
+        full_state = checkpoint["model_state_dict"]
+        
+        # Extract adapter weights
+        adapter_state = {}
+        spatial_encoder_state = {}
+        spatial_decoder_state = {}
+        lora_weights = {}
+        
+        for key, value in full_state.items():
+            if key.startswith("channel_adapter."):
+                # Remove prefix for loading into the module directly
+                new_key = key[len("channel_adapter."):]
+                adapter_state[new_key] = value
+            elif key.startswith("spatial_encoder."):
+                new_key = key[len("spatial_encoder."):]
+                spatial_encoder_state[new_key] = value
+            elif key.startswith("spatial_decoder."):
+                new_key = key[len("spatial_decoder."):]
+                spatial_decoder_state[new_key] = value
+            elif "lora_" in key and "transformer" in key:
+                # LoRA weights in transformer
+                lora_weights[key] = value
+        
+        # Load adapter weights
+        if adapter_state:
+            model.channel_adapter.load_state_dict(adapter_state)
+            print(f"  Loaded channel adapter ({len(adapter_state)} tensors)")
+        
+        if spatial_encoder_state:
+            model.spatial_encoder.load_state_dict(spatial_encoder_state)
+            print(f"  Loaded spatial encoder ({len(spatial_encoder_state)} tensors)")
+        
+        if spatial_decoder_state:
+            model.spatial_decoder.load_state_dict(spatial_decoder_state)
+            print(f"  Loaded spatial decoder ({len(spatial_decoder_state)} tensors)")
+        
+        # Load LoRA weights if present
+        if lora_weights and model.transformer is not None:
+            # Try to load LoRA weights into the transformer
+            transformer_state = model.transformer.state_dict()
+            loaded_lora = 0
+            for key, value in lora_weights.items():
+                # Transform key from full model to transformer-only
+                if key.startswith("transformer."):
+                    transformer_key = key[len("transformer."):]
+                    if transformer_key in transformer_state:
+                        transformer_state[transformer_key] = value
+                        loaded_lora += 1
+            
+            if loaded_lora > 0:
+                model.transformer.load_state_dict(transformer_state)
+                print(f"  Loaded LoRA weights ({loaded_lora} tensors)")
     else:
-        model.load_state_dict(checkpoint)
+        # Try to use the adapter checkpoint file if it exists
+        adapter_path = args.checkpoint.replace(".pt", "_adapters.pt")
+        if os.path.exists(adapter_path):
+            print(f"Using adapter checkpoint: {adapter_path}")
+            model.load_checkpoint(adapter_path)
+        else:
+            raise ValueError(
+                f"Unknown checkpoint format. Expected either:\n"
+                f"  1. Adapter checkpoint (*_adapters.pt)\n"
+                f"  2. Full checkpoint with 'model_state_dict' key\n"
+                f"Hint: Try using the adapters checkpoint: {adapter_path}"
+            )
     
     model.eval()
     print("Model loaded successfully")
