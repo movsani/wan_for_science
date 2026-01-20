@@ -119,13 +119,19 @@ class WellVideoDataset(Dataset):
         """Normalize the input tensor."""
         if self.mu is None or self.sigma is None:
             return x
-        return (x - self.mu) / self.sigma
+        # Move stats to same device as input
+        mu = self.mu.to(x.device) if hasattr(self.mu, 'to') else self.mu
+        sigma = self.sigma.to(x.device) if hasattr(self.sigma, 'to') else self.sigma
+        return (x - mu) / sigma
     
     def denormalize(self, x: torch.Tensor) -> torch.Tensor:
         """Denormalize the tensor back to original scale."""
         if self.mu is None or self.sigma is None:
             return x
-        return x * self.sigma + self.mu
+        # Move stats to same device as input
+        mu = self.mu.to(x.device) if hasattr(self.mu, 'to') else self.mu
+        sigma = self.sigma.to(x.device) if hasattr(self.sigma, 'to') else self.sigma
+        return x * sigma + mu
     
     def __len__(self) -> int:
         return len(self.well_dataset)
