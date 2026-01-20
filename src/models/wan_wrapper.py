@@ -596,6 +596,9 @@ class Wan22VideoModel(nn.Module):
         # Flatten batch and time for adapter processing
         frames_flat = rearrange(physics_frames, "B T H W C -> (B T) C H W")
         
+        # Cast to model dtype (channel adapter may be in bfloat16)
+        frames_flat = frames_flat.to(self.dtype)
+        
         # Apply channel adapter: physics (4ch) -> video (3ch)
         video_frames = self.channel_adapter.encode(frames_flat)
         
