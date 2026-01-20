@@ -77,6 +77,12 @@ def update_config_from_args(config: dict, args: argparse.Namespace) -> dict:
     if args.seed is not None:
         config["training"]["seed"] = args.seed
     
+    # Two-stage training flags
+    if args.freeze_adapters:
+        config["training"]["freeze_adapters"] = True
+    if args.freeze_temporal_predictor:
+        config["training"]["freeze_temporal_predictor"] = True
+    
     return config
 
 
@@ -125,6 +131,18 @@ def main():
     # Logging
     parser.add_argument("--wandb_project", type=str, default=None, help="W&B project name")
     parser.add_argument("--no_wandb", action="store_true", help="Disable W&B logging")
+    
+    # Two-stage training
+    parser.add_argument(
+        "--freeze_adapters", 
+        action="store_true", 
+        help="Freeze adapters (Stage 2: train temporal predictor only)"
+    )
+    parser.add_argument(
+        "--freeze_temporal_predictor", 
+        action="store_true", 
+        help="Freeze temporal predictor (Stage 1: train adapters only)"
+    )
     
     # Other
     parser.add_argument("--seed", type=int, default=None, help="Random seed")
