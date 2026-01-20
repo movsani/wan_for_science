@@ -365,7 +365,11 @@ class Trainer:
                 if (self.val_loader and 
                     train_config.get("detailed_eval_every", 1000) and 
                     self.global_step % train_config.get("detailed_eval_every", 1000) == 0):
-                    self.detailed_evaluation(num_samples=50)
+                    try:
+                        # Use fewer samples and steps for fast evaluation during training
+                        self.detailed_evaluation(num_samples=10)
+                    except Exception as e:
+                        print_rank0(f"Detailed evaluation failed: {e}")
                     self.model.train()
                 
                 # Checkpointing
@@ -447,18 +451,18 @@ class Trainer:
         """
         Run detailed evaluation with baseline comparison.
         Prints both model and baseline metrics without saving.
+        All ranks run evaluation, only rank 0 prints.
         """
         self.model.eval()
         model = self.model.module if hasattr(self.model, 'module') else self.model
         
-        if not is_main_process(self.rank):
-            # Only rank 0 prints
-            barrier()
-            return
+        # All ranks will run evaluation, but only rank 0 prints
+        should_print = is_main_process(self.rank)
         
-        print_rank0("\n" + "=" * 60)
-        print_rank0(f"DETAILED EVALUATION @ Step {self.global_step}")
-        print_rank0("=" * 60)
+        if should_print:
+            print_rank0("\n" + "=" * 60)
+            print_rank0(f"DETAILED EVALUATION @ Step {self.global_step}")
+            print_rank0("=" * 60)
         
         # Accumulators
         model_vrmse_sum = None
@@ -497,7 +501,7 @@ class Trainer:
                     predictions = model.predict_i2v_diffusion(
                         cond_frame=cond_frame,
                         num_frames=T_out,
-                        num_inference_steps=eval_config.get("num_inference_steps", 30),
+                        num_inference_steps=eval_config.get("num_inference_steps", 10),  # Fewer steps for fast eval
                         guidance_scale=eval_config.get("guidance_scale", 5.0),
                         text_prompt=text_prompt,
                     )

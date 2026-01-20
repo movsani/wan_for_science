@@ -13,6 +13,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, List, Optional, Tuple, Any, Union
 from einops import rearrange
+from tqdm import tqdm
 import numpy as np
 
 try:
