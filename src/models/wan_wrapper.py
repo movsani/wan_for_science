@@ -1122,6 +1122,11 @@ class Wan22VideoModel(nn.Module):
         """
         Training forward pass using native I2V diffusion.
         
+        Wan 2.2 I2V conditioning works by:
+        1. Concatenating [mask (4ch), cond_latent (16ch)] = 20ch conditioning
+        2. Concatenating conditioning with noisy latent: [noisy (16ch), cond (20ch)] = 36ch
+        3. Passing the 36-channel tensor as hidden_states to transformer
+        
         Args:
             cond_frame: Conditioning physics frame (B, 1, H, W, C) or (B, H, W, C)
             target_frames: Target physics frames (B, T, H, W, C)
@@ -1147,7 +1152,7 @@ class Wan22VideoModel(nn.Module):
         cond_video = self.channel_adapter.encode(cond_frame.to(self.dtype))  # (B, 3, H, W)
         cond_video = self.spatial_encoder(cond_video)  # Upsample to video size
         
-        # Target frames
+        # Target frames (includes conditioning frame at t=0)  
         target_flat = rearrange(target_frames, "B T C H W -> (B T) C H W")
         target_video_flat = self.channel_adapter.encode(target_flat.to(self.dtype))
         target_video_flat = self.spatial_encoder(target_video_flat)
@@ -1163,11 +1168,11 @@ class Wan22VideoModel(nn.Module):
                 target_latent = latent_dist.sample() if hasattr(latent_dist, 'sample') else latent_dist
         target_latent = target_latent * scaling_factor  # (B, 16, T_lat, H_lat, W_lat)
         
-        # === Step 3: Prepare I2V conditioning ===
-        y = self._prepare_i2v_conditioning(cond_video, num_output_frames=T_out)
+        # === Step 3: Prepare I2V conditioning (20ch: mask + cond_latent) ===
+        conditioning = self._prepare_i2v_conditioning(cond_video, num_output_frames=T_out)
+        # conditioning shape: (B, 20, T_lat, H_lat, W_lat)
         
         # === Step 4: Sample timestep and add noise ===
-        # Use flow matching / diffusion noise schedule
         timesteps = torch.randint(
             0, self.pipe.scheduler.config.num_train_timesteps,
             (B,), device=target_latent.device
@@ -1175,7 +1180,11 @@ class Wan22VideoModel(nn.Module):
         noise = torch.randn_like(target_latent)
         noisy_latent = self.pipe.scheduler.add_noise(target_latent, noise, timesteps)
         
-        # === Step 5: Get text embeddings ===
+        # === Step 5: Concatenate noisy latent with conditioning ===
+        # Wan 2.2 I2V: hidden_states = [noisy_latent (16ch), conditioning (20ch)] = 36ch
+        hidden_states = torch.cat([noisy_latent, conditioning], dim=1)  # (B, 36, T_lat, H_lat, W_lat)
+        
+        # === Step 6: Get text embeddings ===
         with torch.no_grad():
             text_inputs = self.pipe.tokenizer(
                 [text_prompt] * B,
@@ -1186,40 +1195,23 @@ class Wan22VideoModel(nn.Module):
             ).to(self.device)
             text_embeds = self.pipe.text_encoder(**text_inputs)[0]
         
-        # === Step 6: Predict noise with transformer ===
-        # Concatenate noisy latent with conditioning
-        # x = [noisy_latent (16ch), y (20ch)] -> but Wan expects them handled separately
-        # The transformer takes x and y as separate inputs
-        
-        # Get grid sizes for positional encoding
-        _, _, T_lat, H_lat, W_lat = noisy_latent.shape
-        grid_sizes = torch.tensor([[T_lat, H_lat, W_lat]], device=noisy_latent.device).expand(B, -1)
-        seq_len = T_lat * H_lat * W_lat
-        
-        # Prepare transformer input
-        # Note: The diffusers implementation may differ from original Wan code
-        # We need to check the exact interface
+        # === Step 7: Predict noise with transformer ===
+        # Diffusers WanTransformer3DModel expects:
+        # - hidden_states: (B, C, T, H, W) - the 36-channel input
+        # - timestep: (B,) - diffusion timestep
+        # - encoder_hidden_states: (B, L, D) - text embeddings
         model_output = self.transformer(
-            hidden_states=noisy_latent,
+            hidden_states=hidden_states,
             timestep=timesteps,
             encoder_hidden_states=text_embeds,
-            # I2V conditioning passed as image_latents
-            image_latents=y,
             return_dict=False,
         )[0]
         
-        # === Step 7: Compute loss ===
-        # For flow matching: predict velocity, loss = MSE(pred, target_velocity)
-        # For DDPM/epsilon: predict noise, loss = MSE(pred, noise)
-        # Wan2.2 uses flow matching (v-prediction)
-        
-        # Compute target velocity: v = noise - target_latent (simplified)
-        # Actually for flow matching: v = (noise - x0) / sigma
-        # But for training, we typically just predict the noise
+        # === Step 8: Compute loss ===
+        # The model outputs noise prediction, loss = MSE(pred, noise)
         diffusion_loss = F.mse_loss(model_output, noise)
         
         # === Optional: Adapter reconstruction loss ===
-        # Reconstruct conditioning frame through adapters
         cond_recon = self.channel_adapter.decode(
             self.spatial_decoder(cond_video)
         )
@@ -1274,7 +1266,7 @@ class Wan22VideoModel(nn.Module):
         H_vid, W_vid = cond_video.shape[2:]
         
         # === Prepare I2V conditioning ===
-        y = self._prepare_i2v_conditioning(cond_video, num_output_frames=num_frames)
+        conditioning = self._prepare_i2v_conditioning(cond_video, num_output_frames=num_frames)
         
         # === Get text embeddings (with negative prompt for CFG) ===
         text_inputs = self.pipe.tokenizer(
@@ -1312,23 +1304,24 @@ class Wan22VideoModel(nn.Module):
         for t in tqdm(timesteps, desc="Denoising", leave=False):
             timestep = t.expand(B)
             
+            # Concatenate latent with conditioning for transformer input
+            hidden_states = torch.cat([latent, conditioning], dim=1)  # (B, 36, T_lat, H_lat, W_lat)
+            
             # Classifier-free guidance: predict with and without text conditioning
             if guidance_scale > 1.0:
                 # Conditional prediction
                 noise_pred_cond = self.transformer(
-                    hidden_states=latent,
+                    hidden_states=hidden_states,
                     timestep=timestep,
                     encoder_hidden_states=text_embeds,
-                    image_latents=y,
                     return_dict=False,
                 )[0]
                 
                 # Unconditional prediction
                 noise_pred_uncond = self.transformer(
-                    hidden_states=latent,
+                    hidden_states=hidden_states,
                     timestep=timestep,
                     encoder_hidden_states=neg_embeds,
-                    image_latents=y,
                     return_dict=False,
                 )[0]
                 
@@ -1336,10 +1329,9 @@ class Wan22VideoModel(nn.Module):
                 noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
             else:
                 noise_pred = self.transformer(
-                    hidden_states=latent,
+                    hidden_states=hidden_states,
                     timestep=timestep,
                     encoder_hidden_states=text_embeds,
-                    image_latents=y,
                     return_dict=False,
                 )[0]
             
