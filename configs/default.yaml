@@ -57,6 +57,12 @@ training:
   num_epochs: 50
   max_steps: null  # If set, overrides num_epochs
   
+  # Two-stage training (recommended for temporal predictor)
+  # Stage 1: Train adapters only (freeze_temporal_predictor: true)
+  # Stage 2: Train temporal predictor (freeze_adapters: true, load Stage 1 checkpoint)
+  freeze_adapters: false        # Freeze channel/spatial adapters
+  freeze_temporal_predictor: false  # Freeze temporal predictor (if using)
+  
   # Optimizer
   optimizer:
     name: "adamw"

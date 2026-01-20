@@ -79,6 +79,15 @@ class Trainer:
         if hasattr(self.model, 'load_pretrained'):
             self.model.load_pretrained()
         
+        # Apply freeze settings for two-stage training
+        train_config = config["training"]
+        if train_config.get("freeze_adapters", False):
+            if hasattr(self.model, 'freeze_adapters'):
+                self.model.freeze_adapters()
+        if train_config.get("freeze_temporal_predictor", False):
+            if hasattr(self.model, 'freeze_temporal_predictor'):
+                self.model.freeze_temporal_predictor()
+        
         # Wrap model for distributed training
         if self.world_size > 1:
             if config["distributed"].get("use_fsdp", False):

@@ -212,19 +212,27 @@ class Wan22VideoModel(nn.Module):
         print("Model loaded successfully!")
     
     def get_trainable_parameters(self) -> List[nn.Parameter]:
-        """Get all trainable parameters."""
+        """Get all trainable parameters (only those with requires_grad=True)."""
         params = []
         
         # Channel adapter parameters
-        params.extend(self.channel_adapter.parameters())
+        for p in self.channel_adapter.parameters():
+            if p.requires_grad:
+                params.append(p)
         
         # Spatial adapter parameters
-        params.extend(self.spatial_encoder.parameters())
-        params.extend(self.spatial_decoder.parameters())
+        for p in self.spatial_encoder.parameters():
+            if p.requires_grad:
+                params.append(p)
+        for p in self.spatial_decoder.parameters():
+            if p.requires_grad:
+                params.append(p)
         
         # Temporal predictor parameters (if enabled)
         if self.temporal_predictor is not None:
-            params.extend(self.temporal_predictor.parameters())
+            for p in self.temporal_predictor.parameters():
+                if p.requires_grad:
+                    params.append(p)
         
         # LoRA parameters (if enabled)
         if self.lora_enabled and self.transformer is not None:
@@ -233,6 +241,48 @@ class Wan22VideoModel(nn.Module):
                     params.append(param)
         
         return params
+    
+    def freeze_adapters(self):
+        """Freeze channel and spatial adapters (for Stage 2 training)."""
+        self.channel_adapter.requires_grad_(False)
+        self.spatial_encoder.requires_grad_(False)
+        self.spatial_decoder.requires_grad_(False)
+        print("Adapters frozen")
+    
+    def unfreeze_adapters(self):
+        """Unfreeze channel and spatial adapters."""
+        self.channel_adapter.requires_grad_(True)
+        self.spatial_encoder.requires_grad_(True)
+        self.spatial_decoder.requires_grad_(True)
+        print("Adapters unfrozen")
+    
+    def freeze_temporal_predictor(self):
+        """Freeze temporal predictor (for Stage 1 training)."""
+        if self.temporal_predictor is not None:
+            self.temporal_predictor.requires_grad_(False)
+            print("Temporal predictor frozen")
+    
+    def unfreeze_temporal_predictor(self):
+        """Unfreeze temporal predictor."""
+        if self.temporal_predictor is not None:
+            self.temporal_predictor.requires_grad_(True)
+            print("Temporal predictor unfrozen")
+    
+    def freeze_lora(self):
+        """Freeze LoRA parameters."""
+        if self.lora_enabled and self.transformer is not None:
+            for param in self.transformer.parameters():
+                param.requires_grad_(False)
+            print("LoRA frozen")
+    
+    def unfreeze_lora(self):
+        """Unfreeze LoRA parameters."""
+        if self.lora_enabled and self.transformer is not None:
+            # Only unfreeze the LoRA parameters, not base model
+            for name, param in self.transformer.named_parameters():
+                if 'lora' in name.lower():
+                    param.requires_grad_(True)
+            print("LoRA unfrozen")
     
     def prepare_physics_input(
         self, 
