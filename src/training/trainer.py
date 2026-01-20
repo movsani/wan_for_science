@@ -13,6 +13,7 @@ import json
 from pathlib import Path
 
 from .optimizer import create_optimizer, create_scheduler, WarmupCosineScheduler
+from ..evaluation.metrics import compute_vrmse, compute_mse
 from .distributed import (
     setup_distributed,
     cleanup_distributed,
@@ -344,6 +345,13 @@ class Trainer:
                     self.log_metrics({"val/loss": val_loss}, self.global_step)
                     self.model.train()
                 
+                # Detailed evaluation with baseline comparison (every 1000 steps)
+                if (self.val_loader and 
+                    train_config.get("detailed_eval_every", 1000) and 
+                    self.global_step % train_config.get("detailed_eval_every", 1000) == 0):
+                    self.detailed_evaluation(num_samples=50)
+                    self.model.train()
+                
                 # Checkpointing
                 if (train_config.get("checkpoint_every") and
                     self.global_step % train_config["checkpoint_every"] == 0):
@@ -407,6 +415,131 @@ class Trainer:
         avg_loss = reduce_loss(avg_loss_tensor).item()
         
         return avg_loss
+    
+    @torch.no_grad()
+    def detailed_evaluation(self, num_samples: int = 50):
+        """
+        Run detailed evaluation with baseline comparison.
+        Prints both model and baseline metrics without saving.
+        """
+        self.model.eval()
+        model = self.model.module if hasattr(self.model, 'module') else self.model
+        
+        if not is_main_process(self.rank):
+            # Only rank 0 prints
+            barrier()
+            return
+        
+        print_rank0("\n" + "=" * 60)
+        print_rank0(f"DETAILED EVALUATION @ Step {self.global_step}")
+        print_rank0("=" * 60)
+        
+        # Accumulators
+        model_vrmse_sum = None
+        baseline_vrmse_sum = None
+        model_mse_sum = 0.0
+        baseline_mse_sum = 0.0
+        n_evaluated = 0
+        
+        field_names = ["density", "pressure", "velocity_x", "velocity_y"]
+        
+        for batch in self.val_loader:
+            if n_evaluated >= num_samples:
+                break
+            
+            # Get data (use unnormalized for proper VRMSE calculation)
+            input_frames = batch["input_frames"].to(self.device)
+            target_frames = batch["target_frames"].to(self.device)
+            input_normalized = batch["input_frames_normalized"].to(self.device)
+            
+            B = input_frames.shape[0]
+            T_out = target_frames.shape[1]
+            
+            # Model prediction
+            with torch.amp.autocast(
+                device_type="cuda",
+                enabled=self.config["training"]["mixed_precision"] in ["fp16", "bf16"],
+                dtype=torch.bfloat16 if self.config["training"]["mixed_precision"] == "bf16" else torch.float16,
+            ):
+                if hasattr(model, 'predict_with_temporal_predictor'):
+                    predictions = model.predict_with_temporal_predictor(
+                        input_normalized,
+                        num_frames=T_out,
+                    )
+                else:
+                    # Fallback: just return input
+                    predictions = input_frames[:, -T_out:]
+            
+            # Denormalize if needed
+            if hasattr(self.val_loader.dataset, 'denormalize'):
+                predictions = self.val_loader.dataset.denormalize(predictions)
+            
+            # Baseline: repeat last frame
+            last_frame = input_frames[:, -1:, :, :, :]  # (B, 1, H, W, C)
+            baseline_pred = last_frame.expand(-1, T_out, -1, -1, -1)  # (B, T_out, H, W, C)
+            
+            # Compute VRMSE (per field)
+            model_vrmse = compute_vrmse(predictions, target_frames, field_dim=-1)
+            baseline_vrmse = compute_vrmse(baseline_pred, target_frames, field_dim=-1)
+            
+            # Accumulate
+            if model_vrmse_sum is None:
+                model_vrmse_sum = model_vrmse * B
+                baseline_vrmse_sum = baseline_vrmse * B
+            else:
+                model_vrmse_sum += model_vrmse * B
+                baseline_vrmse_sum += baseline_vrmse * B
+            
+            model_mse_sum += compute_mse(predictions, target_frames).item() * B
+            baseline_mse_sum += compute_mse(baseline_pred, target_frames).item() * B
+            
+            n_evaluated += B
+        
+        # Average
+        model_vrmse_avg = model_vrmse_sum / n_evaluated
+        baseline_vrmse_avg = baseline_vrmse_sum / n_evaluated
+        model_mse_avg = model_mse_sum / n_evaluated
+        baseline_mse_avg = baseline_mse_sum / n_evaluated
+        
+        # Print results
+        print_rank0(f"\nSamples evaluated: {n_evaluated}")
+        print_rank0("\n{:<12} {:>12} {:>12} {:>10}".format(
+            "Field", "Model VRMSE", "Baseline", "Δ%"
+        ))
+        print_rank0("-" * 48)
+        
+        for i, name in enumerate(field_names):
+            m_v = model_vrmse_avg[i].item()
+            b_v = baseline_vrmse_avg[i].item()
+            delta_pct = ((m_v - b_v) / b_v) * 100 if b_v > 0 else 0
+            win = "✓" if m_v < b_v else ""
+            print_rank0(f"{name:<12} {m_v:>12.4f} {b_v:>12.4f} {delta_pct:>+9.1f}% {win}")
+        
+        # Mean
+        model_mean = model_vrmse_avg.mean().item()
+        baseline_mean = baseline_vrmse_avg.mean().item()
+        delta_pct = ((model_mean - baseline_mean) / baseline_mean) * 100
+        print_rank0("-" * 48)
+        print_rank0(f"{'Mean':<12} {model_mean:>12.4f} {baseline_mean:>12.4f} {delta_pct:>+9.1f}%")
+        
+        print_rank0(f"\nMSE: Model={model_mse_avg:.4f}, Baseline={baseline_mse_avg:.4f}")
+        
+        if model_mean < baseline_mean:
+            print_rank0("🎉 Model BEATS baseline!")
+        else:
+            print_rank0(f"Model needs {(model_mean/baseline_mean - 1)*100:.1f}% improvement to beat baseline")
+        
+        print_rank0("=" * 60 + "\n")
+        
+        # Log metrics
+        self.log_metrics({
+            "detailed_eval/model_vrmse": model_mean,
+            "detailed_eval/baseline_vrmse": baseline_mean,
+            "detailed_eval/model_mse": model_mse_avg,
+            "detailed_eval/baseline_mse": baseline_mse_avg,
+        }, self.global_step)
+        
+        barrier()
     
     def save_checkpoint(self, filename: str):
         """Save training checkpoint."""
