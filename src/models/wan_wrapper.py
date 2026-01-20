@@ -860,6 +860,9 @@ class Wan22VideoModel(nn.Module):
         # Rearrange for temporal predictor: (B, T, C, H, W)
         input_latents_seq = rearrange(input_latents, "B C T H W -> B T C H W")
         
+        # Cast to model dtype (temporal predictor may be in bfloat16)
+        input_latents_seq = input_latents_seq.to(self.dtype)
+        
         # Step 2: Calculate how many latent frames needed for num_frames output
         # VAE decode formula: T_decoded = (T_latent - 1) * 4 + 1
         # So to get at least num_frames: T_latent >= (num_frames - 1) / 4 + 1
