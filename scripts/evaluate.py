@@ -186,6 +186,11 @@ def main():
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     
     model = create_wan22_model(config)
+    
+    # Load the pretrained Wan2.2 pipeline (required for generation)
+    print("Loading pretrained Wan2.2 pipeline...")
+    model.load_pretrained()
+    
     model.to(device)
     
     # Load checkpoint
