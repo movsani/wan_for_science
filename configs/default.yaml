@@ -93,8 +93,9 @@ training:
 distributed:
   enabled: true
   backend: "nccl"
-  # FSDP settings
-  use_fsdp: true
+  # FSDP settings (disabled by default due to mixed dtype issues with LoRA)
+  # LoRA creates float32 adapters while Wan2.2 uses bfloat16
+  use_fsdp: false
   fsdp_sharding_strategy: "FULL_SHARD"
   # DeepSpeed settings (alternative to FSDP)
   use_deepspeed: false
