@@ -217,16 +217,16 @@ def main():
             if key.startswith("channel_adapter."):
                 # Remove prefix for loading into the module directly
                 new_key = key[len("channel_adapter."):]
-                adapter_state[new_key] = value
+                adapter_state[new_key] = value.to(device)
             elif key.startswith("spatial_encoder."):
                 new_key = key[len("spatial_encoder."):]
-                spatial_encoder_state[new_key] = value
+                spatial_encoder_state[new_key] = value.to(device)
             elif key.startswith("spatial_decoder."):
                 new_key = key[len("spatial_decoder."):]
-                spatial_decoder_state[new_key] = value
+                spatial_decoder_state[new_key] = value.to(device)
             elif "lora_" in key and "transformer" in key:
                 # LoRA weights in transformer
-                lora_weights[key] = value
+                lora_weights[key] = value  # Will be moved to device later
         
         # Load adapter weights
         if adapter_state:
@@ -251,7 +251,8 @@ def main():
                 if key.startswith("transformer."):
                     transformer_key = key[len("transformer."):]
                     if transformer_key in transformer_state:
-                        transformer_state[transformer_key] = value
+                        # Ensure tensor is on the correct device
+                        transformer_state[transformer_key] = value.to(device)
                         loaded_lora += 1
             
             if loaded_lora > 0:
