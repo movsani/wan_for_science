@@ -29,7 +29,9 @@ lora:
 
 # Data configuration
 data:
-  base_path: "./datasets"
+  # Note: well_download creates a nested structure, so use ./datasets/datasets
+  # Or move data after download to ./datasets/turbulent_radiative_layer_2D
+  base_path: "./datasets/datasets"
   dataset_name: "turbulent_radiative_layer_2D"
   n_steps_input: 4  # Number of input frames
   n_steps_output: 8  # Number of output frames to predict
