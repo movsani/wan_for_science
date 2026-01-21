@@ -1212,19 +1212,52 @@ class Wan22VideoModel(nn.Module):
         # The model outputs noise prediction, loss = MSE(pred, noise)
         diffusion_loss = F.mse_loss(model_output, noise)
         
-        # === Optional: Adapter reconstruction loss ===
+        # === VAE Reconstruction Loss (CRITICAL for decoder training) ===
+        # This trains the decoder to handle VAE-decoded video frames
+        # Without this, the decoder only sees direct encode-decode and fails at inference
+        with torch.no_grad():
+            # Decode the target latent through VAE (what happens at inference time)
+            vae_decoded_video = self.vae.decode(target_latent / scaling_factor, return_dict=False)[0]
+            # Denormalize VAE output from [-1, 1] to [0, 1]
+            vae_decoded_video = (vae_decoded_video + 1) / 2
+            vae_decoded_video = torch.clamp(vae_decoded_video, 0, 1)
+        
+        # Now pass through spatial decoder and channel adapter decoder (trainable)
+        vae_decoded_flat = rearrange(vae_decoded_video, "B C T H W -> (B T) C H W")
+        vae_decoded_flat = vae_decoded_flat.to(self.dtype)
+        vae_decoded_spatial = self.spatial_decoder(vae_decoded_flat)
+        vae_recon_physics = self.channel_adapter.decode(vae_decoded_spatial)
+        vae_recon_physics = rearrange(vae_recon_physics, "(B T) C H W -> B T C H W", B=B)
+        
+        # Target physics in correct format for comparison
+        target_physics_channelfirst = target_frames  # Already (B, T, C, H, W)
+        
+        # Handle temporal dimension mismatch (VAE compression may reduce frames)
+        T_recon = vae_recon_physics.shape[1]
+        T_target = target_physics_channelfirst.shape[1]
+        if T_recon < T_target:
+            target_physics_channelfirst = target_physics_channelfirst[:, :T_recon]
+        elif T_recon > T_target:
+            vae_recon_physics = vae_recon_physics[:, :T_target]
+        
+        # VAE reconstruction loss - trains decoder on actual inference path
+        vae_recon_loss = F.mse_loss(vae_recon_physics, target_physics_channelfirst.to(self.dtype))
+        
+        # === Simple adapter loss (as before, for regularization) ===
         cond_recon = self.channel_adapter.decode(
             self.spatial_decoder(cond_video)
         )
         adapter_loss = F.mse_loss(cond_recon, cond_frame.to(self.dtype))
         
         # === Total loss ===
-        total_loss = diffusion_loss + 0.1 * adapter_loss
+        # vae_recon_loss is the key one for proper decoder training
+        total_loss = diffusion_loss + 0.1 * adapter_loss + 0.5 * vae_recon_loss
         
         return {
             "loss": total_loss,
             "diffusion_loss": diffusion_loss,
             "adapter_loss": adapter_loss,
+            "vae_recon_loss": vae_recon_loss,
             "timesteps": timesteps,
         }
     

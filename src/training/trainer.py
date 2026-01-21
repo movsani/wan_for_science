@@ -338,6 +338,7 @@ class Trainer:
                         "train/loss": reduced_loss,
                         "train/adapter_loss": outputs.get("adapter_loss", torch.tensor(0)).item() if torch.is_tensor(outputs.get("adapter_loss", 0)) else outputs.get("adapter_loss", 0),
                         "train/spatial_loss": outputs.get("spatial_loss", torch.tensor(0)).item() if torch.is_tensor(outputs.get("spatial_loss", 0)) else outputs.get("spatial_loss", 0),
+                        "train/vae_recon_loss": outputs.get("vae_recon_loss", torch.tensor(0)).item() if torch.is_tensor(outputs.get("vae_recon_loss", 0)) else outputs.get("vae_recon_loss", 0),
                         "train/lr": self.optimizer.param_groups[0]["lr"],
                         "train/epoch": self.epoch,
                     }
