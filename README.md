@@ -112,7 +112,7 @@ model:
 
 Uses the [turbulent_radiative_layer_2D](https://polymathic-ai.org/the_well/datasets/turbulent_radiative_layer_2D/) dataset:
 - **4 Fields**: density, pressure, velocity_x, velocity_y
-- **Resolution**: 128 × 384
+- **Resolution**: 384 × 128 (W×H)
 
 ```bash
 python scripts/download_data.py --output_dir ./datasets
