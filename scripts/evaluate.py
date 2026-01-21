@@ -146,6 +146,11 @@ def main():
         help="Number of rollout steps for temporal evaluation"
     )
     parser.add_argument(
+        "--skip_rollout",
+        action="store_true",
+        help="Skip rollout evaluation (faster, only computes single-shot metrics)"
+    )
+    parser.add_argument(
         "--device",
         type=str,
         default="cuda",
@@ -325,6 +330,52 @@ def main():
         save_predictions=True,
     )
     
+    # === Per-frame VRMSE analysis (from single-shot predictions) ===
+    pred_path = Path(args.output_dir) / "predictions.pt"
+    if pred_path.exists():
+        print("\n" + "=" * 60)
+        print("PER-FRAME VRMSE (single-shot, no autoregressive)")
+        print("=" * 60)
+        
+        pred_data = torch.load(pred_path, weights_only=False)
+        predictions = pred_data["predictions"]
+        targets = pred_data["targets"]
+        inputs = pred_data["inputs"]
+        
+        T = min(predictions.shape[1], targets.shape[1])
+        field_names = ["density", "pressure", "velocity_x", "velocity_y"]
+        
+        def per_frame_vrmse(pred, target):
+            """Compute VRMSE per channel for a single frame."""
+            vrmse = []
+            for c in range(pred.shape[-1]):
+                p = pred[..., c].flatten()
+                t = target[..., c].flatten()
+                var = t.var()
+                if var > 1e-8:
+                    rmse = ((p - t) ** 2).mean().sqrt()
+                    vrmse.append((rmse / var.sqrt()).item())
+                else:
+                    vrmse.append(float('nan'))
+            return vrmse
+        
+        print(f"\n{'Frame':<8}", end="")
+        for name in field_names:
+            print(f"{name:<12}", end="")
+        print(f"{'Mean':<12}  {'Baseline':<12}")
+        print("-" * 80)
+        
+        last_frame = inputs[:, -1]  # Conditioning frame for baseline
+        
+        for t in range(T):
+            model_vrmse = per_frame_vrmse(predictions[:, t], targets[:, t])
+            baseline_vrmse = per_frame_vrmse(last_frame, targets[:, t])
+            
+            print(f"{t:<8}", end="")
+            for v in model_vrmse:
+                print(f"{v:<12.4f}", end="")
+            print(f"{np.nanmean(model_vrmse):<12.4f}  {np.nanmean(baseline_vrmse):<12.4f}")
+    
     # Print comparative results
     print("\n" + "=" * 60)
     print("RESULTS COMPARISON")
@@ -394,12 +445,16 @@ def main():
         print("\nCreating visualizations...")
         evaluator.visualize_predictions(num_samples=5)
     
-    # Compute rollout metrics
-    print("\nComputing rollout metrics...")
-    rollout_metrics = evaluator.compute_rollout_metrics(
-        num_rollout_steps=args.rollout_steps,
-        num_samples=min(20, args.num_samples),
-    )
+    # Compute rollout metrics (optional - slow because it runs denoising autoregressively)
+    if args.skip_rollout:
+        print("\nSkipping rollout evaluation (use --rollout_steps to enable)")
+        rollout_metrics = {"skipped": True}
+    else:
+        print("\nComputing rollout metrics...")
+        rollout_metrics = evaluator.compute_rollout_metrics(
+            num_rollout_steps=args.rollout_steps,
+            num_samples=min(20, args.num_samples),
+        )
     
     print("\nRollout VRMSE per step:")
     per_step_vrmse = rollout_metrics.get("per_step_vrmse", [])
