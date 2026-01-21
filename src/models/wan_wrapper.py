@@ -1153,16 +1153,25 @@ class Wan22VideoModel(nn.Module):
         cond_video = self.channel_adapter.encode(cond_frame.to(self.dtype))  # (B, 3, H, W)
         cond_video = self.spatial_encoder(cond_video)  # Upsample to video size
         
-        # Target frames (includes conditioning frame at t=0)  
+        # Target frames 
         target_flat = rearrange(target_frames, "B T C H W -> (B T) C H W")
         target_video_flat = self.channel_adapter.encode(target_flat.to(self.dtype))
         target_video_flat = self.spatial_encoder(target_video_flat)
-        target_video = rearrange(target_video_flat, "(B T) C H W -> B C T H W", B=B, T=T_out)
+        target_video_only = rearrange(target_video_flat, "(B T) C H W -> B C T H W", B=B, T=T_out)
         
-        # === Step 2: VAE encode targets ===
+        # === CRITICAL FIX: Full video MUST include conditioning at position 0 ===
+        # I2V expects: [cond_frame, target_frame0, target_frame1, ..., target_frameN-1]
+        # This ensures latent[0] contains conditioning, matching the mask
+        cond_video_expanded = cond_video.unsqueeze(2)  # (B, 3, 1, H, W)
+        full_video = torch.cat([cond_video_expanded, target_video_only], dim=2)  # (B, 3, 1+T_out, H, W)
+        
+        # We now have 1 + T_out frames. Use all of them for proper alignment.
+        n_video_frames = full_video.shape[2]
+        
+        # === Step 2: VAE encode the FULL video (cond + targets) ===
         scaling_factor = self._get_vae_scaling_factor()
         with torch.no_grad():
-            latent_dist = self.vae.encode(target_video)
+            latent_dist = self.vae.encode(full_video)
             if hasattr(latent_dist, 'latent_dist'):
                 target_latent = latent_dist.latent_dist.sample()
             else:
@@ -1170,7 +1179,8 @@ class Wan22VideoModel(nn.Module):
         target_latent = target_latent * scaling_factor  # (B, 16, T_lat, H_lat, W_lat)
         
         # === Step 3: Prepare I2V conditioning (20ch: mask + cond_latent) ===
-        conditioning = self._prepare_i2v_conditioning(cond_video, num_output_frames=T_out)
+        # Use n_video_frames to match the full video length
+        conditioning = self._prepare_i2v_conditioning(cond_video, num_output_frames=n_video_frames)
         # conditioning shape: (B, 20, T_lat, H_lat, W_lat)
         
         # === Step 4: Sample timestep and add noise ===
@@ -1214,7 +1224,7 @@ class Wan22VideoModel(nn.Module):
         
         # === VAE Reconstruction Loss (CRITICAL for decoder training) ===
         # This trains the decoder to handle VAE-decoded video frames
-        # Without this, the decoder only sees direct encode-decode and fails at inference
+        # Note: target_latent encodes [cond, target0, target1, ...] so decoded frame 0 = cond
         with torch.no_grad():
             # Decode the target latent through VAE (what happens at inference time)
             vae_decoded_video = self.vae.decode(target_latent / scaling_factor, return_dict=False)[0]
@@ -1227,21 +1237,25 @@ class Wan22VideoModel(nn.Module):
         vae_decoded_flat = vae_decoded_flat.to(self.dtype)
         vae_decoded_spatial = self.spatial_decoder(vae_decoded_flat)
         vae_recon_physics = self.channel_adapter.decode(vae_decoded_spatial)
-        vae_recon_physics = rearrange(vae_recon_physics, "(B T) C H W -> B T C H W", B=B)
+        T_decoded = vae_decoded_video.shape[2]
+        vae_recon_physics = rearrange(vae_recon_physics, "(B T) C H W -> B T C H W", B=B, T=T_decoded)
         
-        # Target physics in correct format for comparison
-        target_physics_channelfirst = target_frames  # Already (B, T, C, H, W)
+        # Frame alignment: decoded = [cond, target0, target1, ...]
+        # frame 0 should match cond_frame, frames 1+ should match target_frames
+        # Build the expected physics: [cond_frame, target_frames]
+        cond_frame_expanded = cond_frame.unsqueeze(1)  # (B, 1, C, H, W)
+        expected_physics = torch.cat([cond_frame_expanded, target_frames], dim=1)  # (B, 1+T_out, C, H, W)
         
         # Handle temporal dimension mismatch (VAE compression may reduce frames)
         T_recon = vae_recon_physics.shape[1]
-        T_target = target_physics_channelfirst.shape[1]
-        if T_recon < T_target:
-            target_physics_channelfirst = target_physics_channelfirst[:, :T_recon]
-        elif T_recon > T_target:
-            vae_recon_physics = vae_recon_physics[:, :T_target]
+        T_expected = expected_physics.shape[1]
+        if T_recon < T_expected:
+            expected_physics = expected_physics[:, :T_recon]
+        elif T_recon > T_expected:
+            vae_recon_physics = vae_recon_physics[:, :T_expected]
         
         # VAE reconstruction loss - trains decoder on actual inference path
-        vae_recon_loss = F.mse_loss(vae_recon_physics, target_physics_channelfirst.to(self.dtype))
+        vae_recon_loss = F.mse_loss(vae_recon_physics, expected_physics.to(self.dtype))
         
         # === Simple adapter loss (as before, for regularization) ===
         cond_recon = self.channel_adapter.decode(
@@ -1324,11 +1338,12 @@ class Wan22VideoModel(nn.Module):
         
         # === Initialize random latent ===
         # VAE stride is (4, 8, 8) for (T, H, W)
-        # Use same T_lat as training: (num_frames - 1) // stride + 1
-        # This produces fewer output frames, which we'll handle in truncation
+        # IMPORTANT: I2V model generates [cond, target0, target1, ...] so we need 1 + num_frames total
+        # Then we return only the generated frames (skip frame 0 which is conditioning)
+        total_video_frames = 1 + num_frames  # cond + targets
         vae_stride_t = 4
-        T_lat = (num_frames - 1) // vae_stride_t + 1
-        # For 8 frames: (8-1)//4 + 1 = 2 latent frames → decodes to 5 frames
+        T_lat = (total_video_frames - 1) // vae_stride_t + 1
+        # For 9 frames (1 cond + 8 target): (9-1)//4 + 1 = 3 latent frames → decodes to 9 frames
         H_lat = H_vid // 8
         W_lat = W_vid // 8
         
@@ -1345,21 +1360,21 @@ class Wan22VideoModel(nn.Module):
             # Concatenate latent with conditioning for transformer input
             hidden_states = torch.cat([latent, conditioning], dim=1)  # (B, 36, T_lat, H_lat, W_lat)
             
-            # Classifier-free guidance: predict with and without text conditioning
+            # Classifier-free guidance
             if guidance_scale > 1.0:
-                # Conditional prediction
-                noise_pred_cond = self.transformer(
-                    hidden_states=hidden_states,
-                    timestep=timestep,
-                    encoder_hidden_states=text_embeds,
-                    return_dict=False,
-                )[0]
-                
-                # Unconditional prediction
+                # Unconditional forward
                 noise_pred_uncond = self.transformer(
                     hidden_states=hidden_states,
                     timestep=timestep,
                     encoder_hidden_states=neg_embeds,
+                    return_dict=False,
+                )[0]
+                
+                # Conditional forward
+                noise_pred_cond = self.transformer(
+                    hidden_states=hidden_states,
+                    timestep=timestep,
+                    encoder_hidden_states=text_embeds,
                     return_dict=False,
                 )[0]
                 
@@ -1391,6 +1406,12 @@ class Wan22VideoModel(nn.Module):
         video_frames = self.spatial_decoder(video_frames)
         physics_frames = self.channel_adapter.decode(video_frames)
         physics_frames = rearrange(physics_frames, "(B T) C H W -> B T H W C", B=B)
+        
+        # === CRITICAL: Skip frame 0 (conditioning) and return only generated frames ===
+        # Frame 0 = conditioning (should match input)
+        # Frames 1+ = generated (what we want to return)
+        if physics_frames.shape[1] > 1:
+            physics_frames = physics_frames[:, 1:]  # Skip conditioning frame
         
         # Truncate to requested number of frames
         if physics_frames.shape[1] > num_frames:
