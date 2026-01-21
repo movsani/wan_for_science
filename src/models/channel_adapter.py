@@ -305,13 +305,16 @@ class ChannelAdapterPair(nn.Module):
         """Convert video back to physics format with optional clamping."""
         output = self.decoder(x)
         
-        # Apply per-field clamping if bounds are set
+        # Apply per-field clamping if bounds are set (out-of-place to preserve gradients)
         if self.output_bounds is not None:
             # output shape: (B, C, H, W)
+            clamped_channels = []
             for c in range(self.physics_channels):
                 min_val = self.output_bounds[c, 0]
                 max_val = self.output_bounds[c, 1]
-                output[:, c] = torch.clamp(output[:, c], min=min_val.item(), max=max_val.item())
+                clamped = torch.clamp(output[:, c:c+1], min=min_val.item(), max=max_val.item())
+                clamped_channels.append(clamped)
+            output = torch.cat(clamped_channels, dim=1)
         
         return output
     
