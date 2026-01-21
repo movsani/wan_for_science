@@ -538,8 +538,8 @@ class Trainer:
                 model_vrmse_sum += model_vrmse * B
                 baseline_vrmse_sum += baseline_vrmse * B
             
-            model_mse_sum += compute_mse(predictions, target_frames).item() * B
-            baseline_mse_sum += compute_mse(baseline_pred, target_frames).item() * B
+            model_mse_sum += compute_mse(predictions, target_frames_eval).item() * B
+            baseline_mse_sum += compute_mse(baseline_pred, target_frames_eval).item() * B
             
             n_evaluated += B
         
